@@ -1,23 +1,31 @@
 /**
  * Powered by:  onnx-community/kitten-tts-nano-0.1-ONNX
  *              phonemizer@1.2.1 (CDN)
- *              onnxruntime-web  (must be loaded by the host page)
+ *              onnxruntime-web  (auto-loaded — no HTML import needed)
  * Config options (all optional):
  *   voiceUrl     {string}  URL to a .bin voice-embedding file  (default: './default.bin')
  *   speed        {number}  Playback speed multiplier           (default: 1.0)
  *   debug        {bool}    Verbose console logging             (default: false)
  *   concurrency  {number}  Max parallel generation jobs        (default: 2)
  *   segmentMax   {number}  Char limit before a chunk is split  (default: 220)
+ *
+ * Usage:
+ *   const tts = new KittenTTS({ voiceUrl: './default.bin', debug: true });
+ *   await tts.ready;             // wait for model + voice to load
+ *   tts.speak('Hello world!');   // call from a user-gesture handler
  */
 
-const _KITTENTTS_SAMPLE_RATE = 24000;
-const _KITTENTTS_CACHE_NAME  = 'kitten-tts-v1';
-const _KITTENTTS_BASE_URL    = 'https://huggingface.co/onnx-community/kitten-tts-nano-0.1-ONNX/resolve/main';
-const _KITTENTTS_MODEL_URL   = `${_KITTENTTS_BASE_URL}/onnx/model_quantized.onnx`;
+const _KITTENTTS_SAMPLE_RATE   = 24000;
+const _KITTENTTS_CACHE_NAME    = 'kitten-tts-v1';
+const _KITTENTTS_BASE_URL      = 'https://huggingface.co/onnx-community/kitten-tts-nano-0.1-ONNX/resolve/main';
+const _KITTENTTS_MODEL_URL     = `${_KITTENTTS_BASE_URL}/onnx/model_quantized.onnx`;
 const _KITTENTTS_TOKENIZER_URL = `${_KITTENTTS_BASE_URL}/tokenizer.json`;
+const _KITTENTTS_ORT_VERSION   = '1.24.3';
+const _KITTENTTS_ORT_CDN       = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${_KITTENTTS_ORT_VERSION}/dist/`;
+const _KITTENTTS_ORT_ESM       = `${_KITTENTTS_ORT_CDN}ort.min.mjs`;
 
 // ---------------------------------------------------------------------------
-//  Inner Engine — wraps the raw KittenTTS ONNX session
+//  Inner Engine
 // ---------------------------------------------------------------------------
 class _KittenEngine {
     constructor(debug) {
@@ -25,56 +33,81 @@ class _KittenEngine {
         this.vocab          = {};
         this.voiceEmbedding = null;
         this.debug          = debug;
-
-        if (typeof ort !== 'undefined') {
-            ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.24.3/dist/';
-        }
+        this._ort           = null;
+        // ONNX WASM does not support concurrent session.run() calls.
+        // Serialize all inference through a promise chain acting as a mutex.
+        this._inferenceQueue = Promise.resolve();
     }
 
     log(msg) {
         if (this.debug) console.log(`%c[KittenEngine] ${msg}`, 'color:#10b981;font-weight:bold;');
     }
 
-    /**
-     * Fetch a URL, reading from CacheStorage first.
-     * On a cache miss the response is fetched from the network and stored.
-     */
+    async _loadOrt() {
+        if (typeof ort !== 'undefined') {
+            this.log('Using globally available ort');
+            this._ort = ort;
+            return;
+        }
+
+        this.log(`Fetching onnxruntime-web@${_KITTENTTS_ORT_VERSION} from CDN…`);
+
+        try {
+            const mod  = await import(_KITTENTTS_ORT_ESM);
+            this._ort  = mod.default ?? mod;
+            this._ort.env.wasm.wasmPaths = _KITTENTTS_ORT_CDN;
+            this.log('ort loaded via ESM import');
+            return;
+        } catch (e) {
+            this.log(`ESM import failed (${e.message}), trying <script> fallback…`);
+        }
+
+        await new Promise((resolve, reject) => {
+            const script   = document.createElement('script');
+            script.src     = `${_KITTENTTS_ORT_CDN}ort.min.js`;
+            script.onload  = resolve;
+            script.onerror = () => reject(new Error('Failed to load ort via <script> tag'));
+            document.head.appendChild(script);
+        });
+
+        if (typeof ort === 'undefined') throw new Error('onnxruntime-web loaded but window.ort is still undefined');
+
+        this._ort = ort;
+        this._ort.env.wasm.wasmPaths = _KITTENTTS_ORT_CDN;
+        this.log('ort loaded via <script> tag');
+    }
+
     async _cachedFetch(url) {
-        // CacheStorage isn't available in all contexts (e.g. non-secure origins)
         if (!('caches' in window)) {
             this.log(`CacheStorage unavailable — fetching direct: ${url}`);
             return fetch(url);
         }
-
-        const cache    = await caches.open(_KITTENTTS_CACHE_NAME);
-        const cached   = await cache.match(url);
-
-        if (cached) {
-            this.log(`Cache HIT: ${url}`);
-            return cached;
-        }
+        const cache  = await caches.open(_KITTENTTS_CACHE_NAME);
+        const cached = await cache.match(url);
+        if (cached) { this.log(`Cache HIT: ${url}`); return cached; }
 
         this.log(`Cache MISS — downloading: ${url}`);
         const response = await fetch(url);
-
         if (!response.ok) throw new Error(`HTTP ${response.status} fetching ${url}`);
-
-        // Clone before consuming — cache keeps one copy, we return the other
         await cache.put(url, response.clone());
         return response;
     }
 
-    /** Load the ONNX model + tokenizer. Calls onStatus(string) for progress. */
     async load(onStatus) {
         try {
+            onStatus('Loading ONNX Runtime…');
+            await this._loadOrt();
+
             onStatus('Loading model…');
             const modelBuf = await (await this._cachedFetch(_KITTENTTS_MODEL_URL)).arrayBuffer();
-            this.session   = await ort.InferenceSession.create(modelBuf, { executionProviders: ['wasm'] });
+            this.session   = await this._ort.InferenceSession.create(modelBuf, {
+                executionProviders: ['wasm'],
+            });
             this.log('ONNX session created');
 
             onStatus('Loading tokenizer…');
             const tokData = await (await this._cachedFetch(_KITTENTTS_TOKENIZER_URL)).json();
-            this.vocab     = tokData.model.vocab;
+            this.vocab    = tokData.model.vocab;
             this.log('Tokenizer ready');
 
             return true;
@@ -85,32 +118,23 @@ class _KittenEngine {
         }
     }
 
-    /** Delete the CacheStorage bucket, forcing a fresh download next time. */
     async clearModelCache() {
-        if (!('caches' in window)) {
-            this.log('CacheStorage unavailable — nothing to clear');
-            return false;
-        }
+        if (!('caches' in window)) { this.log('CacheStorage unavailable'); return false; }
         const deleted = await caches.delete(_KITTENTTS_CACHE_NAME);
-        this.log(deleted ? '✅ Model cache cleared' : 'Cache not found (already clear)');
+        this.log(deleted ? '✅ Model cache cleared' : 'Cache not found');
         return deleted;
     }
 
-    /** Load a .bin voice-embedding file (raw Float32, 256 values). */
     async loadVoice(url) {
-        try {
-            this.log(`Loading voice: ${url}`);
-            const resp = await fetch(url);
-            if (!resp.ok) throw new Error(`HTTP ${resp.status} for ${url}`);
-            this.voiceEmbedding = new Float32Array(await resp.arrayBuffer());
-            this.log(`Voice loaded (${this.voiceEmbedding.length} floats)`);
-        } catch (err) {
-            console.error('[KittenEngine] voice load failed', err);
-            throw err;
-        }
+        this.log(`Loading voice: ${url}`);
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status} fetching voice: ${url}`);
+        const buf = await resp.arrayBuffer();
+        if (buf.byteLength === 0) throw new Error(`Voice file is empty: ${url}`);
+        this.voiceEmbedding = new Float32Array(buf);
+        this.log(`Voice loaded — ${this.voiceEmbedding.length} floats`);
     }
 
-    /** Convert text → phoneme tokens using CDN phonemizer (falls back to ASCII). */
     async tokenize(text) {
         let phonemes = '';
         try {
@@ -118,7 +142,7 @@ class _KittenEngine {
             const arr = await phonemize(text, 'en-us');
             phonemes  = arr.join(' ').replace(/\s+/g, ' ').trim();
         } catch {
-            this.log('Phonemizer unavailable — using ASCII fallback');
+            this.log('Phonemizer unavailable — ASCII fallback');
             phonemes = text.toLowerCase().replace(/[^a-z\s.,!?;:]/g, '');
         }
 
@@ -128,31 +152,41 @@ class _KittenEngine {
             const id = this.vocab[ch];
             if (id !== undefined) tokens.push(BigInt(id));
         }
+        this.log(`Tokenized "${text.slice(0, 40)}" → ${tokens.length} tokens`);
         return new BigInt64Array(tokens);
     }
 
-    /** Generate raw waveform Float32Array for one text segment. */
     async generate(text, speed = 1.0) {
         if (!this.session)        throw new Error('Engine not loaded');
         if (!this.voiceEmbedding) throw new Error('No voice embedding loaded');
 
-        const tokens  = await this.tokenize(text);
-        const results = await this.session.run({
-            input_ids : new ort.Tensor('int64',   tokens,                  [1, tokens.length]),
-            style     : new ort.Tensor('float32', this.voiceEmbedding,     [1, 256]),
-            speed     : new ort.Tensor('float32', new Float32Array([speed]), [1]),
-        });
+        const tokens = await this.tokenize(text);
 
-        // Normalize to ±0.95
-        const waveform = results.waveform.data;
-        let max = 0;
-        for (const v of waveform) max = Math.max(max, Math.abs(v));
-        if (max > 0) for (let i = 0; i < waveform.length; i++) waveform[i] *= (0.95 / max);
+        // Chain onto the inference queue so only one session.run() is active at a time.
+        // Each call waits for the previous to finish before starting.
+        const waveform = await (this._inferenceQueue = this._inferenceQueue.then(async () => {
+            this.log(`Inference start: "${text.slice(0, 40)}"`);
+            const results = await this.session.run({
+                input_ids : new this._ort.Tensor('int64',   tokens,                    [1, tokens.length]),
+                style     : new this._ort.Tensor('float32', this.voiceEmbedding,       [1, 256]),
+                speed     : new this._ort.Tensor('float32', new Float32Array([speed]), [1]),
+            });
+
+            const wav = results.waveform.data;
+            let max = 0;
+            for (const v of wav) max = Math.max(max, Math.abs(v));
+            if (max > 0) for (let i = 0; i < wav.length; i++) wav[i] *= (0.95 / max);
+            this.log(`Generated ${wav.length} samples`);
+            return wav;
+        }));
 
         return waveform;
     }
 }
 
+// ---------------------------------------------------------------------------
+//  Public KittenTTS class
+// ---------------------------------------------------------------------------
 export class KittenTTS {
     constructor(config = {}) {
         this.config = {
@@ -163,48 +197,41 @@ export class KittenTTS {
             segmentMax  : config.segmentMax  ?? 220,
         };
 
-        this._engine       = new _KittenEngine(this.config.debug);
-        this._audioCtx     = null;
-        this.isReady       = false;
+        this._engine    = new _KittenEngine(this.config.debug);
+        this._audioCtx  = null; // created lazily on first speak() to satisfy autoplay policy
+        this.isReady    = false;
 
-        // --- Generation pipeline ---
-        this._textQueue        = [];   // { text, genIndex }
-        this._pendingAudio     = new Map(); // genIndex → AudioBuffer
-        this._activeJobs       = 0;
-        this._nextGenIndex     = 0;
-        this._nextPlayIndex    = 0;
+        this._textQueue     = [];
+        this._pendingAudio  = new Map();
+        this._activeJobs    = 0;
+        this._nextGenIndex  = 0;
+        this._nextPlayIndex = 0;
+        this._isPlaying     = false;
+        this._interrupted   = false;
 
-        // --- Playback ---
-        this._isPlaying    = false;
-        this._interrupted  = false;
-
-        this._init();
+        // Expose a promise callers can await
+        this.ready = this._init();
     }
 
     log(msg, data = '') {
-        if (this.config.debug) {
+        if (this.config.debug)
             console.log(`%c[KittenTTS] ${msg}`, 'color:#2563eb;font-weight:bold;', data);
-        }
     }
 
     // -----------------------------------------------------------------------
-    //  Init
+    //  Init — runs in the background; await tts.ready to know when done
     // -----------------------------------------------------------------------
     async _init() {
         this.log('Initializing…');
 
-        this._audioCtx = new (window.AudioContext || window.webkitAudioContext)({
-            sampleRate: _KITTENTTS_SAMPLE_RATE,
-        });
-
         const ok = await this._engine.load(msg => this.log(msg));
-        if (!ok) return;
+        if (!ok) throw new Error('KittenTTS engine failed to load');
 
         if (this.config.voiceUrl) {
             try {
                 await this._engine.loadVoice(this.config.voiceUrl);
-            } catch {
-                this.log('⚠️ Voice load failed — continuing without voice');
+            } catch (e) {
+                console.warn('[KittenTTS] ⚠️ Voice load failed:', e.message);
             }
         }
 
@@ -213,12 +240,47 @@ export class KittenTTS {
     }
 
     // -----------------------------------------------------------------------
+    //  Create/resume the AudioContext.
+    //  MUST be called inside a user-gesture handler to satisfy autoplay policy.
+    // -----------------------------------------------------------------------
+    async _ensureAudioContext() {
+        if (!this._audioCtx) {
+            this._audioCtx = new (window.AudioContext || window.webkitAudioContext)({
+                sampleRate: _KITTENTTS_SAMPLE_RATE,
+            });
+            this.log(`AudioContext created (state: ${this._audioCtx.state})`);
+        }
+
+        if (this._audioCtx.state === 'suspended') {
+            this.log('AudioContext suspended — resuming…');
+            await this._audioCtx.resume();
+        }
+
+        if (this._audioCtx.state !== 'running') {
+            throw new Error(
+                `AudioContext is "${this._audioCtx.state}". ` +
+                'speak() must be called from a user-gesture handler (click, keydown, etc.).'
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
     //  Public API
     // -----------------------------------------------------------------------
 
-    /** Speak rawText.  Queues behind any audio already playing. */
-    speak(rawText) {
-        if (!this.isReady) { this.log('⚠️ Not ready yet'); return; }
+    /**
+     * Speak rawText.
+     * Returns a Promise that resolves once all segments have been *queued*
+     * (not necessarily finished playing).
+     * MUST be called from a user-gesture handler.
+     */
+    async speak(rawText) {
+        if (!this.isReady) {
+            this.log('Not ready yet — awaiting init…');
+            await this.ready;
+        }
+
+        await this._ensureAudioContext();
 
         this._interrupted = false;
 
@@ -232,30 +294,23 @@ export class KittenTTS {
         this._pumpGenerators();
     }
 
-    /**
-     * Wipe the CacheStorage bucket so the model re-downloads on next load.
-     * Returns a Promise<boolean> — true if the cache existed and was deleted.
-     */
-    clearModelCache() {
-        return this._engine.clearModelCache();
-    }
+    clearModelCache() { return this._engine.clearModelCache(); }
 
-    /** Stop everything immediately and clear all queues. */
     interrupt() {
         this.log('🛑 Interrupt');
-        this._interrupted = true;
-
+        this._interrupted   = true;
         this._textQueue     = [];
         this._pendingAudio  = new Map();
         this._activeJobs    = 0;
         this._nextGenIndex  = 0;
         this._nextPlayIndex = 0;
 
-        // Mute any audio that's mid-play
-        this._audioCtx.suspend().then(() => {
-            this._audioCtx.resume();
-            this._isPlaying = false;
-        });
+        if (this._audioCtx) {
+            this._audioCtx.suspend().then(() => {
+                this._audioCtx.resume();
+                this._isPlaying = false;
+            });
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -279,10 +334,7 @@ export class KittenTTS {
         this.log(`Generating [${genIndex}] "${text.slice(0, 40)}…"`);
 
         try {
-            if (this._audioCtx.state === 'suspended') await this._audioCtx.resume();
-
             const waveform = await this._engine.generate(text, this.config.speed);
-
             if (this._interrupted) { this._activeJobs--; return; }
 
             const buffer = this._waveformToBuffer(waveform);
@@ -292,11 +344,11 @@ export class KittenTTS {
             this._playNextInOrder();
 
         } catch (err) {
-            this.log(`❌ Generation error [${genIndex}]: ${err.message}`);
+            console.error(`[KittenTTS] ❌ Generation error [${genIndex}]:`, err);
         }
 
         this._activeJobs--;
-        this._pumpGenerators(); // fill the slot we just freed
+        this._pumpGenerators();
     }
 
     // -----------------------------------------------------------------------
@@ -305,16 +357,17 @@ export class KittenTTS {
 
     _playNextInOrder() {
         if (this._isPlaying) return;
-        if (!this._pendingAudio.has(this._nextPlayIndex)) return; // next not ready yet
+        if (!this._pendingAudio.has(this._nextPlayIndex)) return;
 
         this._isPlaying = true;
         const buffer    = this._pendingAudio.get(this._nextPlayIndex);
         this._pendingAudio.delete(this._nextPlayIndex);
         this._nextPlayIndex++;
 
-        const source = this._audioCtx.createBufferSource();
+        const source  = this._audioCtx.createBufferSource();
         source.buffer = buffer;
         source.connect(this._audioCtx.destination);
+        this.log(`▶ Playing segment (${buffer.duration.toFixed(2)}s)`);
 
         source.onended = () => {
             this._isPlaying = false;
@@ -334,14 +387,7 @@ export class KittenTTS {
         return buf;
     }
 
-    /**
-     * Splits arbitrary text into safe segments for KittenTTS:
-     *  1. Strip markdown formatting
-     *  2. Split on sentence-ending punctuation
-     *  3. Further split long chunks at clause boundaries (, ; —)
-     */
     _parseText(rawText) {
-        // Strip common markdown
         let text = rawText
             .replace(/\*\*([^*]+)\*\*/g, '$1')
             .replace(/\*([^*]+)\*/g,     '$1')
@@ -350,16 +396,12 @@ export class KittenTTS {
             .replace(/\s+/g,             ' ')
             .trim();
 
-        // Protect common abbreviations
-        const ABBREVS = ['Mr.', 'Mrs.', 'Ms.', 'Dr.', 'Prof.', 'Sr.', 'Jr.', 'St.', 'vs.', 'etc.'];
+        const ABBREVS     = ['Mr.', 'Mrs.', 'Ms.', 'Dr.', 'Prof.', 'Sr.', 'Jr.', 'St.', 'vs.', 'etc.'];
         const PLACEHOLDER = '\x00DOT\x00';
-        for (const abbr of ABBREVS) {
+        for (const abbr of ABBREVS)
             text = text.split(abbr).join(abbr.replace('.', PLACEHOLDER));
-        }
-        // Protect decimal numbers  e.g. "3.14"
         text = text.replace(/(\d+)\.(\d)/g, `$1${PLACEHOLDER}$2`);
 
-        // Primary split: sentence-ending punctuation
         const raw = text.match(/[^.!?]+[.!?]+["'\])]?\s*|[^.!?]+$/g) ?? [text];
 
         const segments = [];
@@ -370,13 +412,7 @@ export class KittenTTS {
             if (s.length <= this.config.segmentMax) {
                 segments.push(s);
             } else {
-                // Secondary split at clause boundaries
-                const parts = s
-                    .split(/(?<=[,;—])\s+/)
-                    .map(p => p.trim())
-                    .filter(Boolean);
-
-                // Merge very short parts back together to avoid tiny utterances
+                const parts = s.split(/(?<=[,;—])\s+/).map(p => p.trim()).filter(Boolean);
                 let acc = '';
                 for (const part of parts) {
                     if (acc.length + part.length + 1 > this.config.segmentMax) {
@@ -390,12 +426,36 @@ export class KittenTTS {
             }
         }
 
-        return segments.filter(s => s.length > 0);
+        // Merge segments under 3 words into the next segment if they fit.
+        const merged = [];
+        let carry = '';
+        for (let i = 0; i < segments.length; i++) {
+            const seg       = carry ? `${carry} ${segments[i]}` : segments[i];
+            const wordCount = seg.trim().split(/\s+/).length;
+            const isShort   = wordCount < 3;
+            const hasNext   = i + 1 < segments.length;
+
+            if (isShort && hasNext && (seg.length + 1 + segments[i + 1].length) <= this.config.segmentMax) {
+                // Too short — carry it forward and merge with the next iteration
+                carry = seg;
+            } else {
+                merged.push(seg);
+                carry = '';
+            }
+        }
+        // If the last segment was left in carry (no next to merge into), flush it
+        if (carry) merged.push(carry);
+
+        return merged.filter(s => s.length > 0);
     }
 }
 
+// ---------------------------------------------------------------------------
+//  Convenience globals
+// ---------------------------------------------------------------------------
 window.initTTS = (config) => {
     window.tts       = new KittenTTS(config);
     window.speak     = (text) => window.tts.speak(text);
     window.interrupt = ()     => window.tts.interrupt();
+    return window.tts.ready;  // so you can: await initTTS({...})
 };
