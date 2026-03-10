@@ -137,6 +137,8 @@ class _KittenEngine {
         // ONNX WASM does not support concurrent session.run() calls.
         // Serialize all inference through a promise chain acting as a mutex.
         this._inferenceQueue = Promise.resolve();
+        this._phonemizerLoadPromise = null;
+        this._phonemizeFn = null;
     }
 
     log(msg) {
@@ -198,6 +200,9 @@ class _KittenEngine {
             onStatus('Loading ONNX Runtime…');
             await this._loadOrt();
 
+            // Warm phonemizer once so tokenize() avoids repeated dynamic imports.
+            this._loadPhonemizer();
+
             onStatus('Loading model…');
             const modelBuf = await (await this._cachedFetch(_KITTENTTS_MODEL_URL)).arrayBuffer();
             this.session   = await this._ort.InferenceSession.create(modelBuf, {
@@ -216,6 +221,26 @@ class _KittenEngine {
             console.error('[KittenEngine] load failed', err);
             return false;
         }
+    }
+
+    async _loadPhonemizer() {
+        if (this._phonemizeFn) return this._phonemizeFn;
+        if (this._phonemizerLoadPromise) return this._phonemizerLoadPromise;
+
+        this._phonemizerLoadPromise = import('https://cdn.jsdelivr.net/npm/phonemizer@1.2.1/dist/phonemizer.js')
+            .then(mod => {
+                const fn = mod?.phonemize;
+                if (typeof fn !== 'function') throw new Error('phonemize export missing');
+                this._phonemizeFn = fn;
+                this.log('Phonemizer ready');
+                return fn;
+            })
+            .catch(err => {
+                this.log(`Phonemizer unavailable (${err.message}) — ASCII fallback`);
+                return null;
+            });
+
+        return this._phonemizerLoadPromise;
     }
 
     async clearModelCache() {
@@ -237,12 +262,12 @@ class _KittenEngine {
 
     async tokenize(text) {
         let phonemes = '';
+        const phonemize = this._phonemizeFn ?? await this._loadPhonemizer();
         try {
-            const { phonemize } = await import('https://cdn.jsdelivr.net/npm/phonemizer@1.2.1/dist/phonemizer.js');
+            if (!phonemize) throw new Error('phonemizer not loaded');
             const arr = await phonemize(text, 'en-us');
             phonemes  = arr.join(' ').replace(/\s+/g, ' ').trim();
         } catch {
-            this.log('Phonemizer unavailable — ASCII fallback');
             phonemes = text.toLowerCase().replace(/[^a-z\s.,!?;:]/g, '');
         }
 
@@ -260,7 +285,7 @@ class _KittenEngine {
         if (!this.session)        throw new Error('Engine not loaded');
         if (!this.voiceEmbedding) throw new Error('No voice embedding loaded');
 
-        const tokens = await this.tokenize(TTSProcessor.parse(text));
+        const tokens = await this.tokenize(text);
 
         // Chain onto the inference queue so only one session.run() is active at a time.
         // Each call waits for the previous to finish before starting.
@@ -294,7 +319,7 @@ export class KittenTTS {
             speed       : config.speed       ?? 1.0,
             debug       : config.debug       ?? false,
             concurrency : config.concurrency ?? 2,
-            segmentMax  : config.segmentMax  ?? 220,
+            segmentMax  : config.segmentMax  ?? 140,
         };
 
         this._engine    = new _KittenEngine(this.config.debug);
@@ -308,6 +333,7 @@ export class KittenTTS {
         this._nextPlayIndex = 0;
         this._isPlaying     = false;
         this._interrupted   = false;
+        this._failedIndices = new Set();
 
         // Expose a promise callers can await
         this.ready = this._init();
@@ -384,7 +410,8 @@ export class KittenTTS {
 
         this._interrupted = false;
 
-        const segments = this._parseText(rawText);
+        const cleaned = TTSProcessor.parse(rawText);
+        const segments = this._parseText(cleaned);
         this.log(`Queuing ${segments.length} segment(s)`);
 
         for (const text of segments) {
@@ -404,6 +431,7 @@ export class KittenTTS {
         this._activeJobs    = 0;
         this._nextGenIndex  = 0;
         this._nextPlayIndex = 0;
+        this._failedIndices = new Set();
 
         if (this._audioCtx) {
             this._audioCtx.suspend().then(() => {
@@ -446,6 +474,8 @@ export class KittenTTS {
 
         } catch (err) {
             console.error(`[KittenTTS] ❌ Generation error [${genIndex}]:`, err);
+            this._failedIndices.add(genIndex);
+            this._playNextInOrder();
         }
 
         this._activeJobs--;
@@ -458,6 +488,13 @@ export class KittenTTS {
 
     _playNextInOrder() {
         if (this._isPlaying) return;
+
+        while (this._failedIndices.has(this._nextPlayIndex)) {
+            this.log(`Skipping failed segment [${this._nextPlayIndex}]`);
+            this._failedIndices.delete(this._nextPlayIndex);
+            this._nextPlayIndex++;
+        }
+
         if (!this._pendingAudio.has(this._nextPlayIndex)) return;
 
         this._isPlaying = true;
@@ -513,12 +550,26 @@ export class KittenTTS {
             if (s.length <= this.config.segmentMax) {
                 segments.push(s);
             } else {
-                const parts = s.split(/(?<=[,;—])\s+/).map(p => p.trim()).filter(Boolean);
+                const parts = s.split(/(?<=[,;:—])\s+/).map(p => p.trim()).filter(Boolean);
                 let acc = '';
                 for (const part of parts) {
                     if (acc.length + part.length + 1 > this.config.segmentMax) {
                         if (acc) segments.push(acc);
-                        acc = part;
+                        if (part.length > this.config.segmentMax) {
+                            const words = part.split(/\s+/).filter(Boolean);
+                            let wordAcc = '';
+                            for (const w of words) {
+                                if (wordAcc.length + w.length + 1 > this.config.segmentMax) {
+                                    if (wordAcc) segments.push(wordAcc);
+                                    wordAcc = w;
+                                } else {
+                                    wordAcc = wordAcc ? `${wordAcc} ${w}` : w;
+                                }
+                            }
+                            acc = wordAcc;
+                        } else {
+                            acc = part;
+                        }
                     } else {
                         acc = acc ? `${acc} ${part}` : part;
                     }
