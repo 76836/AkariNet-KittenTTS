@@ -27,7 +27,7 @@ const _KITTENTTS_ORT_ESM       = `${_KITTENTTS_ORT_CDN}ort.min.mjs`;
 const TTSProcessor = {
     _isLoaded: false,
 
-    async init(src = 'tts-cleaner.js') {
+    async init(src = 'https://76836.github.io/AkariNet-KittenTTS/tts-cleaner.js') {
         if (this._isLoaded) return;
         return new Promise((resolve, reject) => {
             const script = document.createElement('script');
